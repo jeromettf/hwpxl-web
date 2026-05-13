@@ -319,8 +319,12 @@ result
       return { needsOcr: info.per_page < 30, ...info };
     }
 
-    /** PDF.js로 페이지를 캔버스에 렌더하고 Tesseract.js로 OCR.
-     *  Tesseract 결과의 단어 bbox(이미지 픽셀, y는 위→아래)를 PDF 좌표(y는 아래→위)로 뒤집어 반환.
+    /** PDF.js로 페이지를 고해상도 캔버스에 렌더하고 Tesseract.js로 OCR.
+     *
+     *  - 단어 대신 **라인(`data.lines`)** 을 사용해 셀 단위 텍스트가 흩어지지 않게 한다.
+     *  - 좌표는 이미지 픽셀에서 **PDF pt 좌표(72dpi 기준)** 로 변환해 코어 휴리스틱과 단위를 맞춘다.
+     *  - scale을 3.0으로 올려 작은 한글 인식 정확도를 높인다 (시간이 더 걸려도 정확도 우선).
+     *  - confidence가 낮은 라인은 노이즈로 보고 제거.
      */
     async function ocrPdfFile(file, onProgress) {
       const bytes = await readBytes(file);
@@ -335,37 +339,71 @@ result
         },
       });
 
+      // PSM 6 = "단일 균일한 텍스트 블록" — 표 페이지에 가장 적합.
+      // preserve_interword_spaces=1 → 단어 사이 공백 정보 보존
+      try {
+        await worker.setParameters({
+          tessedit_pageseg_mode: "6",
+          preserve_interword_spaces: "1",
+        });
+      } catch (e) {
+        console.warn("setParameters failed:", e);
+      }
+
+      const SCALE = 3.0;
       const pages = [];
       try {
         for (let i = 1; i <= numPages; i++) {
           onProgress?.({ phase: "render", page: i, total: numPages });
           const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: 2.0 });
+          const viewport = page.getViewport({ scale: SCALE });
           const canvas = document.createElement("canvas");
           canvas.width = viewport.width;
           canvas.height = viewport.height;
           const ctx = canvas.getContext("2d");
+          // 흰 배경 (투명 PDF 대비)
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
           await page.render({ canvasContext: ctx, viewport }).promise;
 
           onProgress?.({ phase: "ocr", page: i, total: numPages });
           const { data } = await worker.recognize(canvas);
-          // Tesseract 5.x: data.words 가 있을 수도, 없으면 lines→words 평탄화
-          const rawWords = data.words ?? data.lines?.flatMap((l) => l.words ?? []) ?? [];
-          const words = rawWords
-            .filter((w) => (w.text || "").trim())
-            .map((w) => {
-              const b = w.bbox || {};
-              const ih = canvas.height;
-              return {
-                text: w.text.trim(),
-                x0: b.x0 ?? 0,
-                x1: b.x1 ?? 0,
-                // 이미지 좌표(y: 위가 0) → PDF 좌표(y: 아래가 0)로 뒤집기
-                y0: ih - (b.y1 ?? 0),
-                y1: ih - (b.y0 ?? 0),
-              };
+
+          const ih = canvas.height;
+          // 1) 라인 단위로 가져오기 (셀 단위 묶음에 더 적합)
+          const rawLines = data.lines || [];
+          const items = [];
+          for (const line of rawLines) {
+            const text = (line.text || "").replace(/\s+/g, " ").trim();
+            if (!text) continue;
+            // confidence가 너무 낮으면(노이즈) 스킵
+            if (typeof line.confidence === "number" && line.confidence < 40) continue;
+            const b = line.bbox || {};
+            // 이미지 px → PDF pt (스케일 역변환), y는 위→아래 → 아래→위 뒤집기
+            items.push({
+              text,
+              x0: (b.x0 ?? 0) / SCALE,
+              x1: (b.x1 ?? 0) / SCALE,
+              y0: (ih - (b.y1 ?? 0)) / SCALE,
+              y1: (ih - (b.y0 ?? 0)) / SCALE,
             });
-          pages.push({ page_num: i, words });
+          }
+          // 라인이 없으면 단어 단위로 fallback
+          if (items.length === 0 && data.words) {
+            for (const w of data.words) {
+              const text = (w.text || "").trim();
+              if (!text) continue;
+              const b = w.bbox || {};
+              items.push({
+                text,
+                x0: (b.x0 ?? 0) / SCALE,
+                x1: (b.x1 ?? 0) / SCALE,
+                y0: (ih - (b.y1 ?? 0)) / SCALE,
+                y1: (ih - (b.y0 ?? 0)) / SCALE,
+              });
+            }
+          }
+          pages.push({ page_num: i, words: items });
         }
       } finally {
         await worker.terminate();
