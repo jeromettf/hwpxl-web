@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hwpxl — HWP / HWPX / PDF 뷰어 · Excel 변환 (브라우저 단독)</title>
+  <title>hwpxl — HWP / HWPX 뷰어 · Excel 변환 (브라우저 단독)</title>
   <style>
     :root {
       --bg: #f6f7fb; --card: #fff; --text: #1f2433; --muted: #6b7280;
@@ -106,7 +106,7 @@
   <main class="container">
     <header>
       <h1>hwpxl</h1>
-      <p class="subtitle">한컴 HWP / HWPX / PDF 문서를 <strong>브라우저 안에서</strong> 미리 보고 Excel(.xlsx)로 내려받습니다.</p>
+      <p class="subtitle">한컴 HWP / HWPX 문서를 <strong>브라우저 안에서</strong> 미리 보고 Excel(.xlsx)로 내려받습니다.</p>
       <span class="badge">100% 클라이언트 사이드 · 파일이 서버에 올라가지 않습니다</span>
     </header>
 
@@ -116,10 +116,10 @@
     </div>
 
     <section class="dropzone disabled" id="dropzone" aria-label="파일 선택 영역">
-      <input type="file" id="file" accept=".hwp,.hwpx,.odt,.pdf" multiple disabled>
+      <input type="file" id="file" accept=".hwp,.hwpx,.odt" multiple disabled>
       <div class="drop-label">
         <span class="big">파일을 드래그하거나 클릭해 선택 (여러 개 가능)</span>
-        <span class="hint">.hwp · .hwpx · .odt · .pdf · 각 50MB 이하</span>
+        <span class="hint">.hwp · .hwpx · .odt · 각 50MB 이하</span>
       </div>
     </section>
 
@@ -146,7 +146,7 @@
         <summary>어떻게 동작하나요?</summary>
         <ul>
           <li>브라우저에서 <a href="https://pyodide.org/" target="_blank">Pyodide</a>(웹어셈블리 Python)를 한 번 다운로드.</li>
-          <li>같은 폴더의 <code>hwpxl-*.whl</code> 과 <code>olefile</code>, <code>openpyxl</code>, <code>pdfminer.six</code> 를 자동 설치.</li>
+          <li>같은 폴더의 <code>hwpxl-*.whl</code> 과 <code>olefile</code>, <code>openpyxl</code> 을 자동 설치.</li>
           <li>여러분이 올린 파일은 <strong>브라우저 메모리 안에서만</strong> 처리됩니다.</li>
           <li>여러 파일을 한 번에 올리면 결과 .xlsx 들이 자동으로 <strong>zip</strong>으로 묶여 다운로드됩니다.</li>
         </ul>
@@ -154,23 +154,16 @@
       <details>
         <summary>지원 형식과 한계</summary>
         <ul>
-          <li>HWP 5.x, HWPX, ODT, PDF (텍스트 기반)</li>
-          <li>본문 문단·표·셀 병합 추출. PDF는 좌표 기반 표 추정.</li>
-          <li>이미지·도형·수식은 포함되지 않습니다.</li>
-          <li>암호화된 문서, 스캔(이미지) PDF는 처리할 수 없습니다.</li>
+          <li>HWP 5.x (한글 2007 이후 OLE), HWPX (한글 2014+ XML/ZIP), ODT</li>
+          <li>본문 문단·표·셀 병합 추출. 이미지·도형·수식은 포함되지 않습니다.</li>
+          <li>암호화된 문서는 처리할 수 없습니다.</li>
         </ul>
       </details>
     </footer>
   </main>
 
-  <!-- Tesseract.js for OCR (텍스트가 없는 PDF 처리용) -->
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-
   <script type="module">
     import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.mjs";
-    import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.min.mjs";
-    pdfjsLib.GlobalWorkerOptions.workerSrc =
-      "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.worker.min.mjs";
 
     const $ = (s) => document.querySelector(s);
     const loader = $("#loader"), loaderText = $("#loader-text");
@@ -234,10 +227,10 @@
         setLoader("lxml(빌트인) 로드 중…");
         await pyodide.loadPackage(["lxml", "micropip"]);
 
-        setLoader("olefile, openpyxl, pdfminer.six 설치 중…");
+        setLoader("olefile, openpyxl 설치 중…");
         await pyodide.runPythonAsync(`
 import micropip
-await micropip.install(['olefile', 'openpyxl', 'pdfminer.six'])
+await micropip.install(['olefile', 'openpyxl'])
         `);
 
         setLoader("hwpxl 설치 중…");
@@ -301,156 +294,18 @@ print('hwpxl', hwpxl.__version__, 'ready')
       return new Uint8Array(buf);
     }
 
-    /** PDF가 텍스트 기반인지 확인. 페이지당 평균 글자 < 30이면 OCR이 필요한 PDF. */
-    async function pdfNeedsOCR(file) {
-      const bytes = await readBytes(file);
-      pyodide.FS.writeFile("/tmp/probe.pdf", bytes);
-      const code = `
-from hwpxl.pdf_reader import pdf_text_char_count
-from pdfminer.high_level import extract_pages
-pages = list(extract_pages('/tmp/probe.pdf'))
-chars = pdf_text_char_count('/tmp/probe.pdf')
-result = {'pages': len(pages), 'chars': chars, 'per_page': chars / max(len(pages), 1)}
-result
-      `;
-      const r = await pyodide.runPythonAsync(code);
-      const info = r.toJs({ dict_converter: Object.fromEntries });
-      r.destroy?.();
-      return { needsOcr: info.per_page < 30, ...info };
-    }
-
-    /** PDF.js로 페이지를 고해상도 캔버스에 렌더하고 Tesseract.js로 OCR.
-     *
-     *  - 단어 대신 **라인(`data.lines`)** 을 사용해 셀 단위 텍스트가 흩어지지 않게 한다.
-     *  - 좌표는 이미지 픽셀에서 **PDF pt 좌표(72dpi 기준)** 로 변환해 코어 휴리스틱과 단위를 맞춘다.
-     *  - scale을 3.0으로 올려 작은 한글 인식 정확도를 높인다 (시간이 더 걸려도 정확도 우선).
-     *  - confidence가 낮은 라인은 노이즈로 보고 제거.
-     */
-    async function ocrPdfFile(file, onProgress) {
-      const bytes = await readBytes(file);
-      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
-      const numPages = pdf.numPages;
-
-      const worker = await Tesseract.createWorker("kor+eng", undefined, {
-        logger: (m) => {
-          if (m.status === "loading tesseract core" || m.status === "loading language traineddata") {
-            onProgress?.({ phase: "loading", msg: m.status, progress: m.progress });
-          }
-        },
-      });
-
-      // PSM 6 = "단일 균일한 텍스트 블록" — 표 페이지에 가장 적합.
-      // preserve_interword_spaces=1 → 단어 사이 공백 정보 보존
-      try {
-        await worker.setParameters({
-          tessedit_pageseg_mode: "6",
-          preserve_interword_spaces: "1",
-        });
-      } catch (e) {
-        console.warn("setParameters failed:", e);
-      }
-
-      const SCALE = 3.0;
-      const pages = [];
-      try {
-        for (let i = 1; i <= numPages; i++) {
-          onProgress?.({ phase: "render", page: i, total: numPages });
-          const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: SCALE });
-          const canvas = document.createElement("canvas");
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext("2d");
-          // 흰 배경 (투명 PDF 대비)
-          ctx.fillStyle = "white";
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          await page.render({ canvasContext: ctx, viewport }).promise;
-
-          onProgress?.({ phase: "ocr", page: i, total: numPages });
-          const { data } = await worker.recognize(canvas);
-
-          const ih = canvas.height;
-          // 1) 라인 단위로 가져오기 (셀 단위 묶음에 더 적합)
-          const rawLines = data.lines || [];
-          const items = [];
-          for (const line of rawLines) {
-            const text = (line.text || "").replace(/\s+/g, " ").trim();
-            if (!text) continue;
-            // confidence가 너무 낮으면(노이즈) 스킵
-            if (typeof line.confidence === "number" && line.confidence < 40) continue;
-            const b = line.bbox || {};
-            // 이미지 px → PDF pt (스케일 역변환), y는 위→아래 → 아래→위 뒤집기
-            items.push({
-              text,
-              x0: (b.x0 ?? 0) / SCALE,
-              x1: (b.x1 ?? 0) / SCALE,
-              y0: (ih - (b.y1 ?? 0)) / SCALE,
-              y1: (ih - (b.y0 ?? 0)) / SCALE,
-            });
-          }
-          // 라인이 없으면 단어 단위로 fallback
-          if (items.length === 0 && data.words) {
-            for (const w of data.words) {
-              const text = (w.text || "").trim();
-              if (!text) continue;
-              const b = w.bbox || {};
-              items.push({
-                text,
-                x0: (b.x0 ?? 0) / SCALE,
-                x1: (b.x1 ?? 0) / SCALE,
-                y0: (ih - (b.y1 ?? 0)) / SCALE,
-                y1: (ih - (b.y0 ?? 0)) / SCALE,
-              });
-            }
-          }
-          pages.push({ page_num: i, words: items });
-        }
-      } finally {
-        await worker.terminate();
-      }
-      return pages;
-    }
-
     /** 한 파일을 변환해서 (basename, xlsxBytes) 반환. */
-    async function convertOne(file, onProgress) {
-      // PDF는 텍스트가 부족하면 OCR 모드로 자동 분기
-      let usedOcr = false;
-      if (/\.pdf$/i.test(file.name) || file.type === "application/pdf") {
-        try {
-          const info = await pdfNeedsOCR(file);
-          if (info.needsOcr) {
-            onProgress?.({ phase: "ocr-start", msg: `${file.name}: 텍스트 적음 → OCR로 처리` });
-            const pages = await ocrPdfFile(file, onProgress);
-            pyodide.globals.set("_ocr_pages", pages);
-            pyodide.globals.set("_orig_name", file.name);
-            await pyodide.runPythonAsync(`
-from hwpxl import extract_blocks_from_ocr, write_document_to_xlsx
-import os
-os.makedirs('/tmp/out_dir', exist_ok=True)
-stem = _orig_name.rsplit('.', 1)[0] or 'output'
-pages = _ocr_pages.to_py()
-blocks = extract_blocks_from_ocr(pages)
-out_path = write_document_to_xlsx(blocks, '/tmp/out_dir/' + stem + '.xlsx')
-print('OCR OK ->', out_path)
-            `);
-            usedOcr = true;
-          }
-        } catch (err) {
-          console.warn("pdfNeedsOCR/ocr failed, fallback to text path:", err);
-        }
-      }
-
-      if (!usedOcr) {
-        const bytes = await readBytes(file);
-        pyodide.FS.writeFile("/tmp/in.bin", bytes);
-        pyodide.globals.set("_orig_name", file.name);
-        await pyodide.runPythonAsync(`
+    async function convertOne(file) {
+      const bytes = await readBytes(file);
+      pyodide.FS.writeFile("/tmp/in.bin", bytes);
+      pyodide.globals.set("_orig_name", file.name);
+      await pyodide.runPythonAsync(`
 from hwpxl import convert_to_xlsx, detect_format, HwpFormat
 import os
 fmt = detect_format('/tmp/in.bin')
 if fmt == HwpFormat.UNKNOWN:
-    raise RuntimeError('HWP/HWPX/ODT/PDF 형식이 아닙니다.')
-ext = {HwpFormat.HWP:'.hwp', HwpFormat.HWPX:'.hwpx', HwpFormat.ODT:'.odt', HwpFormat.PDF:'.pdf'}[fmt]
+    raise RuntimeError('HWP/HWPX/ODT 형식이 아닙니다.')
+ext = {HwpFormat.HWP:'.hwp', HwpFormat.HWPX:'.hwpx', HwpFormat.ODT:'.odt'}[fmt]
 typed = '/tmp/in' + ext
 os.replace('/tmp/in.bin', typed)
 os.makedirs('/tmp/out_dir', exist_ok=True)
@@ -461,15 +316,14 @@ os.replace(typed, work)
 out_path = convert_to_xlsx(work, '/tmp/out_dir')
 os.remove(work)
 print('OK ->', out_path)
-        `);
-      }
+      `);
 
       const files = pyodide.FS.readdir("/tmp/out_dir").filter((n) => n.endsWith(".xlsx"));
       if (!files.length) throw new Error("변환 결과가 없습니다.");
       const name = files[0];
       const out = pyodide.FS.readFile("/tmp/out_dir/" + name);
       pyodide.FS.unlink("/tmp/out_dir/" + name);
-      return { name, bytes: out, usedOcr };
+      return { name, bytes: out };
     }
 
     btnView.addEventListener("click", async () => {
@@ -486,8 +340,8 @@ from hwpxl import detect_format, HwpFormat, extract_blocks, render_body
 import os
 fmt = detect_format('/tmp/in.bin')
 if fmt == HwpFormat.UNKNOWN:
-    raise RuntimeError('HWP/HWPX/ODT/PDF 형식이 아닙니다.')
-ext = {HwpFormat.HWP:'.hwp', HwpFormat.HWPX:'.hwpx', HwpFormat.ODT:'.odt', HwpFormat.PDF:'.pdf'}[fmt]
+    raise RuntimeError('HWP/HWPX/ODT 형식이 아닙니다.')
+ext = {HwpFormat.HWP:'.hwp', HwpFormat.HWPX:'.hwpx', HwpFormat.ODT:'.odt'}[fmt]
 typed = '/tmp/in' + ext
 os.replace('/tmp/in.bin', typed)
 blocks = extract_blocks(typed)
@@ -526,20 +380,9 @@ render_body(blocks)
           item.state = "run"; renderQueue();
           setStatus(`변환 중 [${i + 1}/${queue.length}] ${item.file.name}`, "info");
           try {
-            const r = await convertOne(item.file, (ev) => {
-              if (ev.phase === "loading") {
-                setStatus(`[${i + 1}/${queue.length}] OCR 엔진 로드 중… (한국어 모델 ~15MB)`, "info");
-              } else if (ev.phase === "ocr-start") {
-                setStatus(`[${i + 1}/${queue.length}] ${ev.msg}`, "info");
-              } else if (ev.phase === "render") {
-                setStatus(`[${i + 1}/${queue.length}] PDF 렌더링 ${ev.page}/${ev.total}`, "info");
-              } else if (ev.phase === "ocr") {
-                setStatus(`[${i + 1}/${queue.length}] OCR ${ev.page}/${ev.total} 페이지…`, "info");
-              }
-            });
+            const r = await convertOne(item.file);
             results.push(r);
             item.state = "ok";
-            if (r.usedOcr) item.message = "OCR";
             ok++;
           } catch (err) {
             console.error(err);
