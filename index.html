@@ -163,8 +163,14 @@
     </footer>
   </main>
 
+  <!-- Tesseract.js for OCR (텍스트가 없는 PDF 처리용) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
   <script type="module">
     import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.mjs";
+    import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.min.mjs";
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.worker.min.mjs";
 
     const $ = (s) => document.querySelector(s);
     const loader = $("#loader"), loaderText = $("#loader-text");
@@ -295,12 +301,112 @@ print('hwpxl', hwpxl.__version__, 'ready')
       return new Uint8Array(buf);
     }
 
-    /** 한 파일을 변환해서 (basename, xlsxBytes) 반환. */
-    async function convertOne(file) {
+    /** PDF가 텍스트 기반인지 확인. 페이지당 평균 글자 < 30이면 OCR이 필요한 PDF. */
+    async function pdfNeedsOCR(file) {
       const bytes = await readBytes(file);
-      pyodide.FS.writeFile("/tmp/in.bin", bytes);
-      pyodide.globals.set("_orig_name", file.name);
-      await pyodide.runPythonAsync(`
+      pyodide.FS.writeFile("/tmp/probe.pdf", bytes);
+      const code = `
+from hwpxl.pdf_reader import pdf_text_char_count
+from pdfminer.high_level import extract_pages
+pages = list(extract_pages('/tmp/probe.pdf'))
+chars = pdf_text_char_count('/tmp/probe.pdf')
+result = {'pages': len(pages), 'chars': chars, 'per_page': chars / max(len(pages), 1)}
+result
+      `;
+      const r = await pyodide.runPythonAsync(code);
+      const info = r.toJs({ dict_converter: Object.fromEntries });
+      r.destroy?.();
+      return { needsOcr: info.per_page < 30, ...info };
+    }
+
+    /** PDF.js로 페이지를 캔버스에 렌더하고 Tesseract.js로 OCR.
+     *  Tesseract 결과의 단어 bbox(이미지 픽셀, y는 위→아래)를 PDF 좌표(y는 아래→위)로 뒤집어 반환.
+     */
+    async function ocrPdfFile(file, onProgress) {
+      const bytes = await readBytes(file);
+      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+      const numPages = pdf.numPages;
+
+      const worker = await Tesseract.createWorker("kor+eng", undefined, {
+        logger: (m) => {
+          if (m.status === "loading tesseract core" || m.status === "loading language traineddata") {
+            onProgress?.({ phase: "loading", msg: m.status, progress: m.progress });
+          }
+        },
+      });
+
+      const pages = [];
+      try {
+        for (let i = 1; i <= numPages; i++) {
+          onProgress?.({ phase: "render", page: i, total: numPages });
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = document.createElement("canvas");
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext("2d");
+          await page.render({ canvasContext: ctx, viewport }).promise;
+
+          onProgress?.({ phase: "ocr", page: i, total: numPages });
+          const { data } = await worker.recognize(canvas);
+          // Tesseract 5.x: data.words 가 있을 수도, 없으면 lines→words 평탄화
+          const rawWords = data.words ?? data.lines?.flatMap((l) => l.words ?? []) ?? [];
+          const words = rawWords
+            .filter((w) => (w.text || "").trim())
+            .map((w) => {
+              const b = w.bbox || {};
+              const ih = canvas.height;
+              return {
+                text: w.text.trim(),
+                x0: b.x0 ?? 0,
+                x1: b.x1 ?? 0,
+                // 이미지 좌표(y: 위가 0) → PDF 좌표(y: 아래가 0)로 뒤집기
+                y0: ih - (b.y1 ?? 0),
+                y1: ih - (b.y0 ?? 0),
+              };
+            });
+          pages.push({ page_num: i, words });
+        }
+      } finally {
+        await worker.terminate();
+      }
+      return pages;
+    }
+
+    /** 한 파일을 변환해서 (basename, xlsxBytes) 반환. */
+    async function convertOne(file, onProgress) {
+      // PDF는 텍스트가 부족하면 OCR 모드로 자동 분기
+      let usedOcr = false;
+      if (/\.pdf$/i.test(file.name) || file.type === "application/pdf") {
+        try {
+          const info = await pdfNeedsOCR(file);
+          if (info.needsOcr) {
+            onProgress?.({ phase: "ocr-start", msg: `${file.name}: 텍스트 적음 → OCR로 처리` });
+            const pages = await ocrPdfFile(file, onProgress);
+            pyodide.globals.set("_ocr_pages", pages);
+            pyodide.globals.set("_orig_name", file.name);
+            await pyodide.runPythonAsync(`
+from hwpxl import extract_blocks_from_ocr, write_document_to_xlsx
+import os
+os.makedirs('/tmp/out_dir', exist_ok=True)
+stem = _orig_name.rsplit('.', 1)[0] or 'output'
+pages = _ocr_pages.to_py()
+blocks = extract_blocks_from_ocr(pages)
+out_path = write_document_to_xlsx(blocks, '/tmp/out_dir/' + stem + '.xlsx')
+print('OCR OK ->', out_path)
+            `);
+            usedOcr = true;
+          }
+        } catch (err) {
+          console.warn("pdfNeedsOCR/ocr failed, fallback to text path:", err);
+        }
+      }
+
+      if (!usedOcr) {
+        const bytes = await readBytes(file);
+        pyodide.FS.writeFile("/tmp/in.bin", bytes);
+        pyodide.globals.set("_orig_name", file.name);
+        await pyodide.runPythonAsync(`
 from hwpxl import convert_to_xlsx, detect_format, HwpFormat
 import os
 fmt = detect_format('/tmp/in.bin')
@@ -310,23 +416,22 @@ ext = {HwpFormat.HWP:'.hwp', HwpFormat.HWPX:'.hwpx', HwpFormat.ODT:'.odt', HwpFo
 typed = '/tmp/in' + ext
 os.replace('/tmp/in.bin', typed)
 os.makedirs('/tmp/out_dir', exist_ok=True)
-# 결과 stem은 원본 이름 기반
 stem = _orig_name.rsplit('.', 1)[0] or 'output'
-# 임시 파일을 stem 이름으로 만들고 변환
 work = '/tmp/work/' + stem + ext
 os.makedirs('/tmp/work', exist_ok=True)
 os.replace(typed, work)
 out_path = convert_to_xlsx(work, '/tmp/out_dir')
 os.remove(work)
 print('OK ->', out_path)
-      `);
-      // out_dir 안의 가장 최근 .xlsx (단일 변환이므로 하나만 있을 것)
-      const files = pyodide.FS.readdir("/tmp/out_dir").filter(n => n.endsWith(".xlsx"));
+        `);
+      }
+
+      const files = pyodide.FS.readdir("/tmp/out_dir").filter((n) => n.endsWith(".xlsx"));
       if (!files.length) throw new Error("변환 결과가 없습니다.");
       const name = files[0];
       const out = pyodide.FS.readFile("/tmp/out_dir/" + name);
       pyodide.FS.unlink("/tmp/out_dir/" + name);
-      return { name, bytes: out };
+      return { name, bytes: out, usedOcr };
     }
 
     btnView.addEventListener("click", async () => {
@@ -383,9 +488,21 @@ render_body(blocks)
           item.state = "run"; renderQueue();
           setStatus(`변환 중 [${i + 1}/${queue.length}] ${item.file.name}`, "info");
           try {
-            const r = await convertOne(item.file);
+            const r = await convertOne(item.file, (ev) => {
+              if (ev.phase === "loading") {
+                setStatus(`[${i + 1}/${queue.length}] OCR 엔진 로드 중… (한국어 모델 ~15MB)`, "info");
+              } else if (ev.phase === "ocr-start") {
+                setStatus(`[${i + 1}/${queue.length}] ${ev.msg}`, "info");
+              } else if (ev.phase === "render") {
+                setStatus(`[${i + 1}/${queue.length}] PDF 렌더링 ${ev.page}/${ev.total}`, "info");
+              } else if (ev.phase === "ocr") {
+                setStatus(`[${i + 1}/${queue.length}] OCR ${ev.page}/${ev.total} 페이지…`, "info");
+              }
+            });
             results.push(r);
-            item.state = "ok"; ok++;
+            item.state = "ok";
+            if (r.usedOcr) item.message = "OCR";
+            ok++;
           } catch (err) {
             console.error(err);
             item.state = "err";
